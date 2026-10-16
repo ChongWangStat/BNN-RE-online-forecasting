@@ -1,0 +1,18 @@
+\begin{tabular}{ll ccccc ccccc}
+\hline
+Method & Strategy & \multicolumn{5}{c}{AUC by test set (initial, updates 1--4)} & \multicolumn{5}{c}{Pooled over the 2023 test sets} \\
+\cline{3-7}\cline{8-12}
+ & & 1 & 2 & 3 & 4 & 5 & $n$ & Sens. & Spec. & AUC & Brier \\
+\hline
+BNN & Consecutive & 0.85 & 0.77 & 0.65 & 0.75 & 0.72 & 274 & 0.57 & 0.75 & 0.75 & 0.203 \\
+BNN & Cumulative & 0.85 & 0.77 & 0.65 & 0.75 & 0.74 & 274 & 0.54 & 0.81 & 0.75 & 0.203 \\
+LMM-RE & Cons., carry $\bm u$ & 0.85 & 0.75 & 0.60 & 0.80 & 0.77 & 274 & 0.63 & 0.76 & 0.74 & 0.206 \\
+LMM-RE & Cumu., carry $\bm u$ & 0.85 & 0.75 & 0.60 & 0.80 & 0.77 & 274 & 0.59 & 0.76 & 0.74 & 0.205 \\
+LMM-RE & Cumu., re-learn & 0.85 & 0.80 & 0.74 & 0.82 & 0.87 & 274 & 0.64 & 0.83 & 0.80 & 0.186 \\
+BNN-RE & Cons., carry $\bm u$ & 0.86 & 0.76 & 0.63 & 0.81 & 0.76 & 274 & 0.63 & 0.77 & 0.75 & 0.201 \\
+BNN-RE & Cons., re-learn & 0.86 & 0.79 & 0.69 & 0.80 & 0.84 & 274 & 0.59 & 0.81 & 0.78 & 0.191 \\
+BNN-RE & Cumu., carry $\bm u$ & 0.86 & 0.76 & 0.63 & 0.81 & 0.77 & 274 & 0.61 & 0.78 & 0.76 & 0.200 \\
+BNN-RE & Cumu., re-learn & 0.86 & 0.79 & 0.74 & 0.82 & 0.85 & 274 & 0.60 & 0.83 & 0.80 & 0.185 \\
+BNN-RE-batch & Batch retrain & 0.86 & 0.76 & 0.63 & 0.81 & 0.76 & 274 & 0.43 & 0.91 & 0.76 & 0.213 \\
+\hline
+\end{tabular}

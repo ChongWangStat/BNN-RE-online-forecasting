@@ -1,0 +1,6 @@
+results/**/*.npz
+__pycache__/
+*.pyc
+*.xlsx
+*.parquet
+data/
