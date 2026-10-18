@@ -1,188 +1,122 @@
-"""
-Corrected online BNN-RE library.
+"""Online BNN / BNN-RE prediction intervals with posterior recycling (corrected implementation).
 
-Fixes relative to the original notebooks:
- (1) Posterior recycling for constrained parameters (residual SD sigma_e, random-effect SD latent s)
-     is done on the unconstrained scale with the matching bijection, so the recycled prior is exactly the
-     mean-field marginal learned at the previous step.  The original code used AutoDiagonalNormal.get_posterior()
-     moments (unconstrained/logit scale) as if they were on the constrained scale.
- (2) Random-effect priors in the "update u" strategy are aligned to sow sources by name.  The original code took
-     the first k entries of the training random-effect vector regardless of which sources were present.
- (3) The random-effect SD prior is written as sigma_u = s^2 with s ~ Uniform(0.4, 0.8) (positive; the original
-     used Uniform(-0.8, -0.4) and squared it, which gives the identical distribution for sigma_u).
+Model, priors, variational family, optimiser and all hyperparameters follow the original
+notebooks (project2/real_data_clean_code). Four implementation points differ, all of them
+needed to make the code do what the manuscript describes:
+  1. Recycled priors for the constrained parameters (sigma_e, and s where sigma_u = s^2) are
+     placed on the unconstrained scale of the mean-field guide and mapped back with the same
+     bijection Pyro uses (logit for (0,1); scaled logit for (0.4, 0.8)).
+  2. Source effects are recycled by source identity: the random-effect vector always covers the
+     full list of training sources, and design matrices are built by name against that list.
+  3. Consecutive updates recycle the posterior of the preceding update; cumulative updates
+     recycle the initial posterior and use all blocks observed so far.
+  4. (simulation, see run_sim.py) test subjects reuse their own training effect direction.
+Note: Pyro keeps AutoDiagonalNormal parameters in a global store under a fixed name, so a guide must be
+used for prediction immediately after it is fitted; recycled priors are read from the guide object
+(unconstrained_posterior), which returns that guide's own parameters.
 """
-import math, numpy as np, torch, pyro, pyro.distributions as dist
-from pyro.infer import SVI, Trace_ELBO, JitTrace_ELBO
+import numpy as np, torch, pyro, pyro.distributions as dist
+from pyro.infer import SVI, Trace_ELBO, Predictive
 from pyro.infer.autoguide import AutoDiagonalNormal
 
-S_LO, S_HI = 0.4, 0.8          # s ~ U(S_LO, S_HI), sigma_u = s^2  in (0.16, 0.64)
-TAU_LOG = math.log(5.0)        # 5% nursery mortality action threshold on the log scale
+S_LO, S_HI = 0.4, 0.8          # s ~ Uniform(S_LO, S_HI), sigma_u = s^2   (original: Uniform(-.8,-.4)^2)
+W_SCALE = 1.0                  # p(theta) = N(0, 1)                        (original: prior_scale=1)
 
-def sigmoid(t): return torch.sigmoid(t)
-
-class Spec:
-    """Prior specification for one model fit."""
-    def __init__(self, in_dim, hid, levels_seen, levels_new, use_re=True, net_prior=None, re_seen_prior=None,
-                 sig_prior=None, s_prior=None, reset_re=False, prior_scale=1.0, scale_prior='bounded'):
-        self.scale_prior = scale_prior        # 'bounded': s~U(0.4,0.8), sigma_u=s^2, sigma_e~Beta(3,3); 'halfnormal': sigma_u~HN(0.5), sigma_e~HN(1)
-        self.in_dim, self.hid, self.use_re = in_dim, hid, use_re
-        self.levels_seen, self.levels_new = list(levels_seen), list(levels_new)
-        self.levels = self.levels_seen + self.levels_new
-        self.net_prior = net_prior            # None -> N(0, prior_scale); else dict name->(loc, scale)
-        self.re_seen_prior = re_seen_prior    # None -> hierarchical N(0, sigma_u); else (loc, scale) aligned to levels_seen
-        self.sig_prior = sig_prior            # None -> Beta(3,3) on sigma_e; else (loc, scale) for eta_e, sigma_e = sigmoid(eta_e)
-        self.s_prior = s_prior                # None -> U(S_LO,S_HI) on s; else (loc, scale) for eta_s, s = S_LO+(S_HI-S_LO)sigmoid(eta_s)
-        self.reset_re = reset_re
-        self.prior_scale = prior_scale
-
-    def net_shapes(self):
-        if self.hid > 0:
-            return {'w1': (self.hid, self.in_dim), 'b1': (self.hid,), 'w2': (1, self.hid), 'b2': (1,)}
-        return {'beta': (self.in_dim,), 'b0': (1,)}
-
-def make_model(spec: Spec):
-    shapes = spec.net_shapes()
+def make_model(in_dim, hid, n_src, use_re, prior=None, reset_re=False):
+    """prior=None -> initial model.  prior=dict of (loc, scale) on the unconstrained scale -> update model.
+    reset_re=True (variant b): recycle the s latent and redraw the source effects from N(0, s^2).
+    reset_re=False (variant a): recycle each source effect's own marginal; sigma_u fixed (not sampled)."""
     def model(x, z, y=None):
-        net = {}
-        for name, shp in shapes.items():
-            if spec.net_prior is None:
-                d = dist.Normal(torch.zeros(shp), spec.prior_scale * torch.ones(shp))
-            else:
-                loc, sc = spec.net_prior[name]; d = dist.Normal(loc, sc)
-            net[name] = pyro.sample(name, d.to_event(len(shp)))
-        if spec.hid > 0:
-            h = torch.tanh(x @ net['w1'].T + net['b1'])
-            mu = (h @ net['w2'].T + net['b2']).squeeze(-1)
+        if prior is None:
+            w1 = pyro.sample('w1', dist.Normal(0., W_SCALE).expand([hid, in_dim]).to_event(2))
+            b1 = pyro.sample('b1', dist.Normal(0., W_SCALE).expand([hid]).to_event(1))
+            w2 = pyro.sample('w2', dist.Normal(0., W_SCALE).expand([1, hid]).to_event(2))
+            b2 = pyro.sample('b2', dist.Normal(0., W_SCALE).expand([1]).to_event(1))
         else:
-            mu = x @ net['beta'] + net['b0']
-        if spec.use_re:
-            if spec.scale_prior == 'bounded':
-                if spec.s_prior is None:
-                    s = pyro.sample("s", dist.Uniform(S_LO, S_HI))
-                else:
-                    eta_s = pyro.sample("eta_s", dist.Normal(*spec.s_prior)); s = S_LO + (S_HI - S_LO) * sigmoid(eta_s)
-                sig_u = s ** 2
+            w1 = pyro.sample('w1', dist.Normal(*prior['w1']).to_event(2))
+            b1 = pyro.sample('b1', dist.Normal(*prior['b1']).to_event(1))
+            w2 = pyro.sample('w2', dist.Normal(*prior['w2']).to_event(2))
+            b2 = pyro.sample('b2', dist.Normal(*prior['b2']).to_event(1))
+        # batch-safe algebra so that Predictive(parallel=True) can draw all samples at once
+        h = torch.tanh(x @ w1.transpose(-1, -2) + b1.unsqueeze(-2))
+        mu = (h @ w2.transpose(-1, -2) + b2.unsqueeze(-2)).squeeze(-1)
+        if use_re:
+            if prior is None:
+                s = pyro.sample('s', dist.Uniform(S_LO, S_HI))
+                re = pyro.sample('re', dist.Normal(torch.zeros(n_src), (s ** 2) * torch.ones(n_src)).to_event(1))
+            elif reset_re:
+                eta_s = pyro.sample('eta_s', dist.Normal(*prior['eta_s']))
+                s = S_LO + (S_HI - S_LO) * torch.sigmoid(eta_s)
+                re = pyro.sample('re', dist.Normal(torch.zeros(n_src), (s ** 2) * torch.ones(n_src)).to_event(1))
             else:
-                if spec.s_prior is None:
-                    sig_u = pyro.sample("sig_u_hn", dist.HalfNormal(0.5))
-                else:
-                    eta_s = pyro.sample("eta_s", dist.Normal(*spec.s_prior)); sig_u = torch.exp(eta_s)
-            parts = []
-            n_seen, n_new = len(spec.levels_seen), len(spec.levels_new)
-            if n_seen > 0:
-                if spec.re_seen_prior is not None and not spec.reset_re:
-                    loc, sc = spec.re_seen_prior
-                    parts.append(pyro.sample("re_seen", dist.Normal(loc, sc).to_event(1)))
-                else:
-                    parts.append(pyro.sample("re_seen", dist.Normal(torch.zeros(n_seen), sig_u * torch.ones(n_seen)).to_event(1)))
-            if n_new > 0:
-                parts.append(pyro.sample("re_new", dist.Normal(torch.zeros(n_new), sig_u * torch.ones(n_new)).to_event(1)))
-            re = torch.cat(parts, -1)
-            mu = mu + z @ re
-        if spec.scale_prior == 'bounded':
-            if spec.sig_prior is None:
-                sigma = pyro.sample("sigma", dist.Beta(3., 3.))
-            else:
-                eta_e = pyro.sample("eta_e", dist.Normal(*spec.sig_prior)); sigma = sigmoid(eta_e)
+                re = pyro.sample('re', dist.Normal(*prior['re']).to_event(1))
+            mu = mu + torch.matmul(z, re.unsqueeze(-1)).squeeze(-1)
+        if prior is None:
+            sigma = pyro.sample('sigma', dist.Beta(3., 3.))
         else:
-            if spec.sig_prior is None:
-                sigma = pyro.sample("sigma_hn", dist.HalfNormal(1.0))
-            else:
-                eta_e = pyro.sample("eta_e", dist.Normal(*spec.sig_prior)); sigma = torch.exp(eta_e)
-        with pyro.plate("data", x.shape[0]):
-            pyro.sample("obs", dist.Normal(mu, sigma), obs=y)
+            eta_e = pyro.sample('eta_e', dist.Normal(*prior['eta_e']))
+            sigma = torch.sigmoid(eta_e)
+        with pyro.plate('data', x.shape[0]):
+            pyro.sample('obs', dist.Normal(mu, sigma), obs=y)
         return mu
     return model
 
-JIT = False
-def fit(spec, x, z, y, seed, lr=0.005, steps=2000):
+from pyro.infer import JitTrace_ELBO
+def fit(model, x, z, y, seed, lr=0.005, steps=2000, jit=False, init=None):
+    """init=None: Pyro's default initialisation (loc at the prior median, scale 0.1).  init=dict of (loc, scale) per
+    site on the unconstrained scale (the recycled prior): warm start, the variational parameters begin at the previous
+    posterior and the optimisation continues from there."""
     pyro.clear_param_store(); pyro.set_rng_seed(seed)
-    model = make_model(spec); guide = AutoDiagonalNormal(model)
-    elbo = JitTrace_ELBO(ignore_jit_warnings=True) if JIT else Trace_ELBO()
-    svi = SVI(model, guide, pyro.optim.Adam({"lr": lr}), elbo)
+    guide = AutoDiagonalNormal(model)
+    if init is not None:
+        guide(x, z, y)                                   # create the parameters
+        with torch.no_grad():
+            loc = guide.loc.detach().clone(); scale = guide.scale.detach().clone()
+            for (site, lv), (_, sv) in zip(guide._unpack_latent(loc), guide._unpack_latent(scale)):
+                name = {'sigma': 'eta_e', 's': 'eta_s'}.get(site['name'], site['name'])
+                if name in init:
+                    lv.copy_(init[name][0].reshape(lv.shape)); sv.copy_(init[name][1].reshape(sv.shape))
+            guide.loc.data.copy_(loc); guide.scale_unconstrained.data.copy_(torch.log(scale))
+    elbo = JitTrace_ELBO(ignore_jit_warnings=True) if jit else Trace_ELBO()
+    svi = SVI(model, guide, pyro.optim.Adam({'lr': lr}), loss=elbo)
+    loss = None
     for _ in range(steps):
-        loss = svi.step(x, z, y)
-    return model, guide, loss / x.shape[0]
+        loss = svi.step(x, z, y) / x.shape[0]
+    return guide, float(loss)
 
 def unconstrained_posterior(guide):
-    """site name -> (loc, scale) of the mean-field Gaussian on the UNCONSTRAINED scale."""
+    """Per-site (loc, scale) of the mean-field guide on the unconstrained scale.
+    'sigma' (Beta site) -> 'eta_e' (logit scale); 's' (Uniform site) -> 'eta_s' (scaled-logit scale)."""
+    post = guide.get_posterior()
+    loc, scale = post.mean.detach(), post.stddev.detach()
     out = {}
-    locs = list(guide._unpack_latent(guide.loc.detach())); scs = list(guide._unpack_latent(guide.scale.detach()))
-    for (site, l), (_, s) in zip(locs, scs):
-        out[site['name']] = (l.reshape(site['value'].shape).clone(), s.reshape(site['value'].shape).clone())
+    for (site, lv), (_, sv) in zip(guide._unpack_latent(loc), guide._unpack_latent(scale)):
+        name = {'sigma': 'eta_e', 's': 'eta_s'}.get(site['name'], site['name'])
+        out[name] = (lv.clone(), sv.clone())
     return out
 
-def posterior_samples(guide, spec, S=5000, seed=0):
-    """Draw S constrained posterior samples (dict of tensors with leading dim S)."""
-    g = torch.Generator().manual_seed(seed)
-    loc, scale = guide.loc.detach(), guide.scale.detach()
-    eps = torch.randn((S, loc.numel()), generator=g)
-    lat = loc + scale * eps
+def recycled_prior(guide):
+    return unconstrained_posterior(guide)
+
+def predict(model, guide, x, z, seed, n_draws=5000):
+    pyro.set_rng_seed(seed)
+    draws = Predictive(model, guide=guide, num_samples=n_draws, return_sites=('obs',), parallel=True)(x, z)['obs'].detach()
+    return draws.reshape(n_draws, -1).numpy()  # [n_draws, n]
+
+def evaluate(draws, y, alpha=0.05):
+    lo = np.percentile(draws, 100 * alpha / 2, axis=0)
+    hi = np.percentile(draws, 100 * (1 - alpha / 2), axis=0)
+    mean = draws.mean(axis=0); yv = y.numpy()
+    return dict(width=float(np.mean(hi - lo)), cover=float(np.mean((lo < yv) & (yv < hi))),
+                mse=float(np.mean((mean - yv) ** 2)), lo=lo, hi=hi, mean=mean, y=yv)
+
+def posterior_scalars(guide, prior_is_initial):
+    """Posterior mean of sigma_e (and sigma_u when present) from the guide, for monitoring."""
+    pyro.set_rng_seed(0)
+    post = unconstrained_posterior(guide)
     out = {}
-    for site, val in guide._unpack_latent(lat):   # val has shape (S, *site_shape) because lat has leading S
-        name = site['name']; v = val.reshape((S,) + site['value'].shape)
-        hn = (spec.scale_prior != 'bounded')
-        if name == 'sigma':      out['sigma'] = sigmoid(v)                       # Beta support -> sigmoid bijection
-        elif name == 's':        out['s'] = S_LO + (S_HI - S_LO) * sigmoid(v)    # interval bijection
-        elif name == 'sigma_hn': out['sigma'] = torch.exp(v)                     # positive support -> exp bijection
-        elif name == 'sig_u_hn': out['s'] = torch.sqrt(torch.exp(v))             # stored as s with sigma_u = s^2 for downstream code
-        elif name == 'eta_e':    out['sigma'] = torch.exp(v) if hn else sigmoid(v)
-        elif name == 'eta_s':    out['s'] = torch.sqrt(torch.exp(v)) if hn else S_LO + (S_HI - S_LO) * sigmoid(v)
-        else: out[name] = v
+    if 'eta_e' in post:
+        d = dist.Normal(*post['eta_e']).sample((4000,)); out['sigma_e'] = float(torch.sigmoid(d).mean())
+    if 'eta_s' in post:
+        d = dist.Normal(*post['eta_s']).sample((4000,)); out['sigma_u'] = float(((S_LO + (S_HI - S_LO) * torch.sigmoid(d)) ** 2).mean())
     return out
-
-def predict_draws(samples, spec, x, z):
-    """Posterior predictive draws of y: (S, N)."""
-    if spec.hid > 0:
-        h = torch.tanh(torch.einsum('np,shp->snh', x, samples['w1']) + samples['b1'].unsqueeze(1))
-        mu = torch.einsum('snh,soh->sno', h, samples['w2']).squeeze(-1) + samples['b2']
-    else:
-        mu = torch.einsum('np,sp->sn', x, samples['beta']) + samples['b0']
-    if spec.use_re:
-        parts = [samples[k] for k in ('re_seen', 're_new') if k in samples]
-        re = torch.cat(parts, -1)
-        mu = mu + torch.einsum('nk,sk->sn', z, re)
-        unseen = (z.sum(1) == 0)                     # sources absent from the model: draw u from the hierarchical prior N(0, sigma_u)
-        if unseen.any():
-            g0 = torch.Generator().manual_seed(777)
-            sig_u = (samples['s'] ** 2).reshape(-1, 1)
-            mu = mu + unseen.float().unsqueeze(0) * sig_u * torch.randn(mu.shape, generator=g0)
-    sigma = samples['sigma'].reshape(-1, 1)
-    S = mu.shape[0]
-    g = torch.Generator().manual_seed(12345)
-    return mu + sigma * torch.randn(mu.shape, generator=g), mu
-
-def score(draws, y, alpha=0.05):
-    """Per-observation metrics from predictive draws (S,N) and truth y (N,)."""
-    d = draws.numpy(); yv = y.numpy()
-    lo = np.percentile(d, 100 * alpha / 2, axis=0); hi = np.percentile(d, 100 * (1 - alpha / 2), axis=0)
-    mean = d.mean(0); width = hi - lo
-    cover = ((yv > lo) & (yv < hi)).astype(float)
-    iscore = width + (2 / alpha) * (lo - yv) * (yv < lo) + (2 / alpha) * (yv - hi) * (yv > hi)
-    ds = np.sort(d, axis=0); S = d.shape[0]; i = np.arange(1, S + 1)[:, None]
-    e_abs_diff = (2.0 / S ** 2) * ((2 * i - S - 1) * ds).sum(0)
-    crps = np.abs(d - yv[None, :]).mean(0) - 0.5 * e_abs_diff
-    p_exceed = (d > TAU_LOG).mean(0)
-    return dict(lo=lo, hi=hi, mean=mean, width=width, cover=cover, iscore=iscore, crps=crps, p_exceed=p_exceed,
-                sqerr=(mean - yv) ** 2, y=yv)
-
-def zmat(sources, levels):
-    idx = {s: j for j, s in enumerate(levels)}
-    Z = torch.zeros(len(sources), len(levels))
-    for i, s in enumerate(sources):
-        if s in idx: Z[i, idx[s]] = 1.0
-    return Z
-
-def recycled_spec(prev_spec, prev_guide, new_sources, reset_re):
-    """Build the Spec of an update model from the previous model (posterior -> prior)."""
-    post = unconstrained_posterior(prev_guide)
-    net_prior = {k: post[k] for k in prev_spec.net_shapes()}
-    sig_prior = post['sigma'] if 'sigma' in post else (post['sigma_hn'] if 'sigma_hn' in post else post['eta_e'])
-    if not prev_spec.use_re:
-        return Spec(prev_spec.in_dim, prev_spec.hid, [], [], use_re=False, net_prior=net_prior, sig_prior=sig_prior, scale_prior=prev_spec.scale_prior)
-    s_prior = post['s'] if 's' in post else (post['sig_u_hn'] if 'sig_u_hn' in post else post['eta_s'])
-    seen = prev_spec.levels                                  # all sources known to the previous model
-    new = [s for s in dict.fromkeys(new_sources) if s not in set(seen)]
-    re_loc = torch.cat([post[k][0] for k in ('re_seen', 're_new') if k in post]); re_sc = torch.cat([post[k][1] for k in ('re_seen', 're_new') if k in post])
-    return Spec(prev_spec.in_dim, prev_spec.hid, seen, new, use_re=True, net_prior=net_prior,
-                re_seen_prior=(re_loc, re_sc), sig_prior=sig_prior, s_prior=s_prior, reset_re=reset_re, scale_prior=prev_spec.scale_prior)

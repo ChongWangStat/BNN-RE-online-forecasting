@@ -1,65 +1,45 @@
-# BNN-RE: online Bayesian neural networks with random effects for forecasting nursery mortality
+# Bayesian neural network with random effects (BNN-RE) for ongoing forecasting
 
-Code and derived results for
+Code and derived results accompanying "Bayesian Neural Network (BNN) with Random Effects for Ongoing Forecasting of Nursery Mortality in Commercial Swine Production" (Zhang, Magalhães, Linhares, Wang; Frontiers in Veterinary Science, submitted).
 
-> Zhang D, Magalhães ES, Linhares DCL, Wang C. Bayesian Neural Network (BNN) with Random Effects for Ongoing Forecasting of Nursery Mortality in Commercial Swine Production. Submitted to *Frontiers in Veterinary Science* (Veterinary Epidemiology and Economics), 2026.
+## Files
 
-The method fits a Bayesian neural network with a sow-farm-source random intercept by mean-field variational inference and updates it online by recycling the variational posterior as the prior each time a block of groups closes out. The same posterior predictive draws give a 95% prediction interval for each group of pigs and the probability that the group exceeds a mortality action threshold.
-
-## What is in this repository
-
-| Path | Content |
+| File | Purpose |
 |---|---|
-| `bnnre_lib.py` | Models (BNN-RE, BNN, LMM-RE), variational fitting (Pyro `AutoDiagonalNormal`), posterior recycling for online updates with the push-forward of constrained parameters, predictive sampling, scoring (coverage, width, interval score, CRPS, exceedance probability). |
-| `prep_data.py` | Data preparation (variable selection, exclusions, one-hot encoding, standardisation, train/test split). Requires the production records, which are **not** distributed. |
-| `run_real.py` | Field-data study: initial models, four online update strategies, BNN and LMM-RE comparators, batch-retrained BNN-RE. |
-| `run_newsource.py` | Evaluation for sow farm sources held out of training. |
-| `run_sim.py` | Simulation study with the linear, nonlinear and neural-network mean functions, with and without a shift in the variance components. |
-| `run_prior_sens.py` | Prior sensitivity analysis (half-normal scale priors). |
-| `aggregate_*.py` | Build the tables, figures and the numbers quoted in the manuscript from the per-seed result files. |
-| `verify_bug.py` | Reproduces the diagnosis of the unconstrained-scale recycling in the earlier implementation (Supplementary Note S1 of the manuscript). |
-| `results_real/` | Per-seed block-level results of the field-data study (`summary_seed*.csv`) and posterior means of the sow farm random effects (`re_post_seed*.csv`). |
-| `results_newsource/` | Per-seed results of the held-out-source evaluation. |
-| `results_sim/` | Per-seed results of the simulation study (synthetic data). |
-| `results_prior/` | Per-seed results of the prior sensitivity analysis. |
-| `outputs/tables/`, `outputs/figures/` | Aggregated tables (CSV and LaTeX), the manuscript figures (PDF and PNG) and the `numbers_*.tex` macro files used by the manuscript. |
+| `bnnre_lib.py` | Model (BNN-RE and BNN), mean-field variational fitting (Pyro `AutoDiagonalNormal`, Adam), posterior recycling for online updates, vectorised posterior predictive sampling, interval width and coverage. |
+| `prep_real.py` | Data preparation for the production records (requires the proprietary workbook, not included); reproduces the record and predictor counts reported in the paper. |
+| `run_real.py` | Field study, BNN and BNN-RE: initial fit and four five-week updates, consecutive and cumulative schedules, one seed per process (`run_seeds.sh` loops over seeds). Saves per-seed summaries and the per-observation interval bounds used by the calibration. |
+| `run_sim_rest.sh` | Driver for the simulation runs reported in the paper. |
+| `run_real_tempered.py` | Field study, BNN-RE-T: the BNN-RE update with the tempered recycled prior for the residual scale (`run_temper_seeds.sh` loops over seeds; the block size `n_b = 60` is the third argument). |
+| `conformal.py` | BNN-RE-C: conformal-style calibration of the interval half-width on the blocks already forecast, computed after the fact from the saved per-observation predictions (`calibrate_sequence(blocks, alpha)`; the paper uses `alpha = 0.04`). |
+| `sim_batched.py` | Simulation study: all replicates of one functional form fitted at once in pure PyTorch (same model, variational family and objective as the Pyro code). `python sim_batched.py data.xlsx out_sim2 <linear|nonlinear|nn> 100 5` for the 5-block design; `CUMU=0 python sim_batched.py data.xlsx out_sim_long <form> 100 21` for the 20-update horizon. `VARIANTS=a,c` (default) runs BNN-RE and BNN-RE-T. Predictors are resampled from the production data; replace the predictor pool with any matrix of 67 standardised inputs to run it without the proprietary file. |
+| `run_sim.py` | Per-replicate Pyro implementation of the simulation (used to validate `sim_batched.py`; the two agree to within Monte Carlo error). |
+| `analyze_improvements.py` | Exploratory comparison of the refinements on the field data, including the combinations not used in the paper (calibration on the BNN, calibration on the tempered variant). |
+| `make_results.py` | Builds every results table, figure and reported number in the manuscript from the saved run outputs (`key_numbers.json`). |
+| `make_schematic.py` | Draws the schematic of the procedure (Figure 1) with matplotlib. |
+| `results_real/summary_seed*.csv`, `results_real_tempered/summary_seed*.csv` | Per-seed field results (width, coverage, MSE, posterior means of sigma_e and sigma_u, by method, strategy and test set). |
+| `results_sim/sim_*_rep*.csv`, `results_sim_long/sim_*_K21_rep*.csv` | Per-replicate simulation results (5-block and 21-block designs). |
 
-## Data
+## Method summary
 
-The production records (groups of pigs from one U.S. Midwestern swine production system, 2019 to 2023) are proprietary to the participating system and are not included. They are available from the corresponding author on reasonable request and with the permission of the system. Per-observation model outputs are withheld for the same reason; the per-seed block-level summaries and all aggregated results are included.
-
-`prep_data.py` expects the data file at `data/COMPLETE_DATA_MAR_2024.xlsx` or at the path in the environment variable `BNNRE_DATA`.
-
-## Model summary
-
-* `y_ij = NN_theta(x_ij) + u_i + e_ij`, one hidden tanh layer. Priors: `theta ~ N(0, 1)`, `u_i | sigma_u ~ N(0, sigma_u)`, `sigma_u = s^2` with `s ~ U(0.4, 0.8)`, `sigma_e ~ Beta(3, 3)`. Normal distributions are parameterised by mean and standard deviation.
-* Inference: mean-field Gaussian on the unconstrained scale (Pyro `AutoDiagonalNormal`), Adam, 2,000 full-batch iterations (learning rate 0.005 for the field data, 0.01 for the simulation), 5,000 posterior predictive draws.
-* Online update: the variational posterior becomes the prior. Constrained parameters receive the push-forward of their Gaussian through the bijection (logit-normal for `sigma_e`, scaled logit-normal for `s`). Strategy "carry": random effects of known sources are recycled and new sources receive `N(0, sigma_u)`. Strategy "re-learn": all random effects are re-drawn from `N(0, sigma_u)` with `sigma_u` recycled. Each strategy runs as a consecutive update (previous posterior, newest block) or a cumulative update (initial posterior, all blocks).
+* Model: `y_ij = NN_theta(x_ij) + u_i + e_ij`, one hidden tanh layer; priors `theta ~ N(0, 1)`, `u_i | sigma_u ~ N(0, sigma_u)`, `sigma_u = s^2`, `s ~ U(0.4, 0.8)`, `sigma_e ~ Beta(3, 3)`.
+* Inference: mean-field Gaussian variational family on the unconstrained scale, Adam (learning rate 0.005 for the field data, 0.01 for the simulation), full-batch SVI (2,000 epochs for the field data; 1,500 / 2,000 / 2,500 for the linear / nonlinear / NN simulation forms), 5,000 posterior predictive draws, 95% equal-tailed intervals.
+* BNN-RE update: the variational posterior of (theta, u, sigma_e) becomes the prior; sigma_u stays at its initial posterior. Constrained parameters receive their Gaussian on the unconstrained scale (logit for `sigma_e`). Each source effect's marginal is carried forward by source identity. Consecutive updating recycles the preceding posterior and uses the newest block; cumulative updating recycles the initial posterior and uses all blocks observed so far. (`fit()` also accepts `init=prior` to warm-start an update at the recycled prior; the reported runs use Pyro's default initialisation.)
+* BNN-RE-T: as BNN-RE, but the recycled prior of `logit(sigma_e)` has its standard deviation multiplied by `sqrt(n_prev / n_0)` with `n_0 = 60` (a power prior with discount `n_0 / n_prev` on sigma_e only), so the previous posterior counts as 60 observations' worth (about five weeks of groups) of information about the residual scale.
+* BNN-RE-C: standardised scores `|y - c| / h` (centre and half-width of the BNN-RE interval) from all blocks already forecast; the half-width for the next block is multiplied by the `ceil((n + 1)(1 - alpha))`-th smallest score with `alpha = 0.04`; the first block (and any block whose calibration set would hold fewer than 50 scores) keeps the BNN-RE interval.
+* Note: Pyro keeps the guide parameters in a global store under a fixed name, so predictions are always made immediately after the corresponding fit; recycled priors are read from the fitted guide object.
 
 ## Requirements
 
-Python 3.11 or later and the packages in `requirements.txt` (`torch`, `pyro-ppl` 1.9, `numpy`, `pandas`, `scipy`, `matplotlib`, `openpyxl`).
+Python 3.11+, `torch` (CPU), `pyro-ppl` 1.9, `numpy`, `pandas`, `scipy`, `openpyxl`, `matplotlib`, `pillow`.
+
+## Reproducing the paper
 
 ```
-pip install -r requirements.txt
+./run_seeds.sh out_real_jit $(seq 567 616)       # BNN and BNN-RE, 50 seeds
+./run_temper_seeds.sh out_real_t60 60 $(seq 567 616)   # BNN-RE-T
+./run_sim_rest.sh                                 # simulations -> out_sim2 (5 blocks) and out_sim_long (21 blocks)
+python make_results.py out_real_jit out_real_t60 out_sim2 out_sim_long tables figures_tiff
+python make_schematic.py figures/Figure_1.png figures_tiff/Figure_1.tif
 ```
-
-## Reproducing the results
-
-With the data file in place:
-
-```
-python run_real.py 567,568,...,616 2000 results_real
-python run_newsource.py 101,...,120 2000 results_newsource
-for s in shift noshift; do for d in nn linear nonlinear; do python run_sim.py $d $s 1,...,50 2000 results_sim; done; done
-for seed in 567 ... 576; do python run_prior_sens.py $seed results_prior; done
-python aggregate_real.py; python aggregate_newsource.py; python aggregate_sim.py; python aggregate_extra.py
-```
-
-Runs are embarrassingly parallel over seeds. One 2,000-iteration fit takes about 15 s on one CPU core (about 6 s with the JIT ELBO used in `run_sim.py` and `run_newsource.py`). The aggregation scripts write to `outputs/` (or to the directory in `BNNRE_OUT`). Without the data file, `aggregate_sim.py` and the block-level parts of `aggregate_real.py` and `aggregate_newsource.py` run from the included result files; the per-observation figures (forecasts for individual sources, calibration) need the withheld per-observation outputs.
-
-The simulation resamples predictor rows from the field data. To run it without the proprietary file, replace `load_raw()` in `run_sim.py` with any predictor matrix of the same column structure.
-
-## License
-
-MIT License (see `LICENSE`).
+Runs are independent over seeds and can be split across processes. One 2,000-epoch field fit takes about 20 s on one CPU core (about 5 s with Pyro's JIT-compiled ELBO, which `run_real.py` uses); the batched simulation fits 100 replicates in a few minutes per form and update sequence.
