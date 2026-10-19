@@ -27,19 +27,28 @@ def make_model(in_dim, hid, n_src, use_re, prior=None, reset_re=False):
     reset_re=True (variant b): recycle the s latent and redraw the source effects from N(0, s^2).
     reset_re=False (variant a): recycle each source effect's own marginal; sigma_u fixed (not sampled)."""
     def model(x, z, y=None):
-        if prior is None:
-            w1 = pyro.sample('w1', dist.Normal(0., W_SCALE).expand([hid, in_dim]).to_event(2))
-            b1 = pyro.sample('b1', dist.Normal(0., W_SCALE).expand([hid]).to_event(1))
-            w2 = pyro.sample('w2', dist.Normal(0., W_SCALE).expand([1, hid]).to_event(2))
-            b2 = pyro.sample('b2', dist.Normal(0., W_SCALE).expand([1]).to_event(1))
+        if hid == 0:   # linear mean function (Bayesian linear mixed model when use_re): mu = x w + b
+            if prior is None:
+                w2 = pyro.sample('w2', dist.Normal(0., W_SCALE).expand([1, in_dim]).to_event(2))
+                b2 = pyro.sample('b2', dist.Normal(0., W_SCALE).expand([1]).to_event(1))
+            else:
+                w2 = pyro.sample('w2', dist.Normal(*prior['w2']).to_event(2))
+                b2 = pyro.sample('b2', dist.Normal(*prior['b2']).to_event(1))
+            mu = (x @ w2.transpose(-1, -2) + b2.unsqueeze(-2)).squeeze(-1)
         else:
-            w1 = pyro.sample('w1', dist.Normal(*prior['w1']).to_event(2))
-            b1 = pyro.sample('b1', dist.Normal(*prior['b1']).to_event(1))
-            w2 = pyro.sample('w2', dist.Normal(*prior['w2']).to_event(2))
-            b2 = pyro.sample('b2', dist.Normal(*prior['b2']).to_event(1))
-        # batch-safe algebra so that Predictive(parallel=True) can draw all samples at once
-        h = torch.tanh(x @ w1.transpose(-1, -2) + b1.unsqueeze(-2))
-        mu = (h @ w2.transpose(-1, -2) + b2.unsqueeze(-2)).squeeze(-1)
+            if prior is None:
+                w1 = pyro.sample('w1', dist.Normal(0., W_SCALE).expand([hid, in_dim]).to_event(2))
+                b1 = pyro.sample('b1', dist.Normal(0., W_SCALE).expand([hid]).to_event(1))
+                w2 = pyro.sample('w2', dist.Normal(0., W_SCALE).expand([1, hid]).to_event(2))
+                b2 = pyro.sample('b2', dist.Normal(0., W_SCALE).expand([1]).to_event(1))
+            else:
+                w1 = pyro.sample('w1', dist.Normal(*prior['w1']).to_event(2))
+                b1 = pyro.sample('b1', dist.Normal(*prior['b1']).to_event(1))
+                w2 = pyro.sample('w2', dist.Normal(*prior['w2']).to_event(2))
+                b2 = pyro.sample('b2', dist.Normal(*prior['b2']).to_event(1))
+            # batch-safe algebra so that Predictive(parallel=True) can draw all samples at once
+            h = torch.tanh(x @ w1.transpose(-1, -2) + b1.unsqueeze(-2))
+            mu = (h @ w2.transpose(-1, -2) + b2.unsqueeze(-2)).squeeze(-1)
         if use_re:
             if prior is None:
                 s = pyro.sample('s', dist.Uniform(S_LO, S_HI))

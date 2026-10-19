@@ -1,14 +1,14 @@
 """Exploratory variant: BNN-RE with a tempered recycled prior for the residual standard deviation.
 At each update the recycled prior for eta_e (= logit sigma_e) keeps the location of the previous
 posterior but its scale is inflated by sqrt(n_prev / n0), so that the previous posterior counts as n0
-observations instead of n_prev (n0 = one block of about 60 groups).  Everything else is the BNN-RE
+observations instead of n_prev (n0 = one block of groups).  Everything else is the BNN-RE
 update of run_real.py (source effects carried forward by identity, sigma_u fixed).
 Usage: python run_real_tempered.py XLSX OUTDIR N0 SEED [SEED ...]"""
 import sys, os, time, math, numpy as np, pandas as pd, torch
 from prep_real import load, Design
 from bnnre_lib import make_model, fit, recycled_prior, predict, evaluate, posterior_scalars
 
-HID, LR, STEPS, NDRAW, JIT = 20, 0.005, 2000, 5000, True
+from config import HID, LR, STEPS, NDRAW, JIT
 xlsx, out, N0 = sys.argv[1], sys.argv[2], float(sys.argv[3]); seeds = [int(s) for s in sys.argv[4:]]
 os.makedirs(out, exist_ok=True); torch.set_num_threads(1)
 train, blocks, info = load(xlsx); D = Design(train)

@@ -20,19 +20,19 @@ K_TR, N_PER, K_TE, N_TE = 110, 24, 50, 6
 SU_TR, SE_TR, SU_TE, SE_TE = 0.28, 0.62, 0.40, 0.50
 T_MEAN, T_SD = 1.16, 0.39
 
-# ---- predictor pool from the production data (sim-notebook preprocessing) ----
-na = ['', '#N/A', '#N/A N/A', '#NA', '-1.#IND', '-1.#QNAN', '-NaN', '-nan', '1.#IND', '1.#QNAN', '<NA>', 'N/A', 'NA', 'NULL', 'NaN', 'n/a', 'nan', 'null']
-dat = pd.read_excel(xlsx, keep_default_na=False, na_values=na)
-dat['SowFarmMed'] = dat['SowFarmMed'].replace('None', 'none'); dat['WeanPigShot'] = dat['WeanPigShot'].replace('None', 'none')
-dat = dat.dropna().sort_values(by=['SowSource', 'year_num', 'week_num', 'CloseDate'])
-dat.drop(columns=['lot_no2', 'lot_nur', 'CloseDate', 'LotPrefix', 'HeadIn', 'mortality_60days', 'ADG', 'year_num'], inplace=True)
-dat = dat.drop_duplicates()
-num = dat.select_dtypes(include=np.number); numz = (num - num.mean()) / num.std()
-cat = dat.select_dtypes(include=['object', 'string']); cat = pd.get_dummies(cat[[c for c in cat.columns if c != 'SowSource']]).astype(int)
-comb = pd.concat([numz, cat], axis=1)
-all_x = comb[[c for c in comb if c != 'avg_mortality_60days']]; all_y = comb['avg_mortality_60days']
-assert all_x.shape[1] == 67, all_x.shape
-beta = np.linalg.lstsq(all_x.values.astype(float), all_y.values.astype(float), rcond=None)[0]   # linear form (OLS, no intercept, as in the notebook)
+# ---- predictor pool from the production data (same cleaning as the field study: prep_real.clean, winsorised at the
+# training percentiles, numerical fields standardised, categorical fields one-hot encoded; 56 inputs) ----
+from prep_real import clean, load as _load, RESPONSE
+_dat, _info = clean(xlsx); _, _, _linfo = _load(xlsx)
+_num = [c for c in _dat.select_dtypes(include=np.number).columns if c not in ('year_num', RESPONSE)]
+_cat = [c for c in _dat.select_dtypes(include=['object', 'string']).columns if c != 'SowSource']
+for c in _num: _dat[c] = _dat[c].astype(float).clip(*_linfo['winsor_caps'][c])
+numz = (_dat[_num] - _dat[_num].mean()) / _dat[_num].std()
+cat = pd.get_dummies(_dat[_cat]).astype(int)
+all_x = pd.concat([numz, cat], axis=1); all_y = _dat[RESPONSE]        # log nursery mortality
+assert all_x.shape[1] == _linfo['n_inputs'], all_x.shape
+beta = np.linalg.lstsq(all_x.values.astype(float), all_y.values.astype(float), rcond=None)[0]   # linear form: OLS of log mortality on the inputs (no intercept; the mean is rescaled below)
+SU_TE = float(os.environ.get('SU_TE', SU_TE)); SE_TE = float(os.environ.get('SE_TE', SE_TE))   # reverse-drift scenario: SE_TE=0.75
 
 def f_mean(X):
     if form == 'linear':

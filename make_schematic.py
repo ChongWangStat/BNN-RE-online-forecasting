@@ -51,7 +51,7 @@ arrow((54, y2 - 5), (54, y2), color=C_RE, lw=1.3)
 ax.text(90, y2 - 5.8, 'next update (k ← k + 1)', fontsize=6.6, color=C_RE, ha='center', va='top')
 
 # schedules
-box(3, y2 - 1, 34, h2 + 2, 'Two schedules\nConsecutive: prior = posterior\nof Update #k−1, data = block k\n\nCumulative: prior = initial\nposterior, data = blocks 1 … k', '#ffffff', edge=GRID, bold_first=True, fs=7.0)
+box(3, y2 - 1, 34, h2 + 2, 'Two schedules\nConsecutive: prior = posterior\nof Update #k−1, data = block k\n\nCumulative: prior = initial\nposterior, data = blocks 1 … k', '#ffffff', edge=GRID, bold_first=True, fs=6.6)
 arrow((37, y2 + h2 / 2), (44, y2 + h2 / 2), ls=(0, (3, 2)))
 
 # ---------------------------------------------------------------- row 3: the two refinements

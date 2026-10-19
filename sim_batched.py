@@ -4,24 +4,24 @@ Fits all R replicates of a simulation form at once with mean-field Gaussian vari
 written directly in PyTorch: the latent vector of every replicate has its own variational location
 and scale, the single-sample reparameterised ELBO is summed over replicates (they share no parameters,
 so this equals R independent optimisations), and Adam is applied to the variational parameters.
-Model, priors, transforms, update rules (BNN-RE, BNN-RE(sigma_u) variant, BNN; consecutive and
+Model, priors, transforms, update rules (BNN-RE, BNN-RE-T, BNN, the linear mixed model LMM-RE; consecutive and
 cumulative), hyperparameters and predictive sampling are those of bnnre_lib.py / run_sim.py; the
 only difference is the batching, which removes the per-replicate Python overhead.
 
 Usage: python sim_batched.py XLSX OUTDIR FORM [n_reps]
 """
 import sys, os, time, math, numpy as np, pandas as pd, torch
-torch.set_num_threads(2)
+torch.set_num_threads(int(os.environ.get("THREADS", "1")))
 xlsx, out, form = sys.argv[1], sys.argv[2], sys.argv[3]; R = int(sys.argv[4]) if len(sys.argv) > 4 else 100
 KB = int(sys.argv[5]) if len(sys.argv) > 5 else 5      # number of evaluation blocks: 5 (original design) or 20 (long horizon)
 os.makedirs(out, exist_ok=True)
 sys.argv = ['run_sim.py', xlsx, out, form]            # reuse the predictor pool, mean functions and constants of run_sim.py
 src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'run_sim.py')).read().split('def gen')[0]
 exec(src)                                              # defines all_x, f_mean(), HID, LR, STEPS, K_TR, N_PER, K_TE, SU_*, SE_*, T_MEAN, T_SD
-torch.set_num_threads(2)
+torch.set_num_threads(int(os.environ.get("THREADS", "1")))
 N_TE, BLK = (6, 60) if KB == 5 else (KB, 50)          # 50 test subjects x N_TE obs, split into KB blocks of BLK
 N0 = BLK                                               # tempered prior: previous posterior counts as one block
-TAG = '' if KB == 5 else f'_K{KB}'
+TAG = ('' if KB == 5 else f'_K{KB}') + os.environ.get('TAG', '')   # TAG=_rev for the reverse-drift scenario (SE_TE=0.75)
 
 def gen(i):
     rng = np.random.default_rng(40 + i)
@@ -60,7 +60,7 @@ print(f'[{form}] data for {R} replicates in {time.time() - t0:.0f}s', flush=True
 
 # ---------------------------------------------------------------- latent layout
 def layout(hid, use_re, has_s):
-    sizes = [('w1', hid * P), ('b1', hid), ('w2', hid), ('b2', 1)]
+    sizes = [('w2', P), ('b2', 1)] if hid == 0 else [('w1', hid * P), ('b1', hid), ('w2', hid), ('b2', 1)]   # hid = 0: linear mean (LMM-RE)
     if use_re: sizes.append(('re', K_TR))
     if has_s: sizes.append(('eta_s', 1))
     sizes.append(('eta_e', 1))
@@ -72,10 +72,14 @@ def sl(theta, idx, k): a, b = idx[k]; return theta[..., a:b]
 
 def mean_fn(theta, idx, X, subj, hid, use_re):
     """theta [..., R, D]; X [R, n, P]; subj [R, n] -> mu [..., R, n]"""
-    w1 = sl(theta, idx, 'w1').reshape(*theta.shape[:-1], hid, P)
-    b1, w2, b2 = sl(theta, idx, 'b1'), sl(theta, idx, 'w2'), sl(theta, idx, 'b2')
-    h = torch.tanh(torch.matmul(X, w1.transpose(-1, -2)) + b1.unsqueeze(-2))          # [..., R, n, hid]
-    mu = (h * w2.unsqueeze(-2)).sum(-1) + b2                                             # [..., R, n]
+    w2, b2 = sl(theta, idx, 'w2'), sl(theta, idx, 'b2')
+    if hid == 0:
+        mu = (X * w2.unsqueeze(-2)).sum(-1) + b2                                         # linear mean: [..., R, n]
+    else:
+        w1 = sl(theta, idx, 'w1').reshape(*theta.shape[:-1], hid, P)
+        b1 = sl(theta, idx, 'b1')
+        h = torch.tanh(torch.matmul(X, w1.transpose(-1, -2)) + b1.unsqueeze(-2))      # [..., R, n, hid]
+        mu = (h * w2.unsqueeze(-2)).sum(-1) + b2                                         # [..., R, n]
     if use_re:
         re = sl(theta, idx, 're')                                                        # [..., R, K]
         sub = subj.expand(*re.shape[:-1], -1) if re.dim() > 2 else subj
@@ -94,7 +98,7 @@ def log_prior(theta, idx, prior, use_re, reset_re):
     lp = torch.zeros(theta.shape[:-1])
     if prior is None:
         for k in ('w1', 'b1', 'w2', 'b2'):
-            lp = lp + log_normal(sl(theta, idx, k), 0., W_SCALE).sum(-1)
+            if k in idx: lp = lp + log_normal(sl(theta, idx, k), 0., W_SCALE).sum(-1)
         if use_re:
             eta_s = sl(theta, idx, 'eta_s'); sg = torch.sigmoid(eta_s)
             lp = lp + (torch.log(sg) + torch.log(1 - sg)).sum(-1)                        # Uniform(s) on (0.4, 0.8), Jacobian of the scaled logit (constant dropped)
@@ -104,7 +108,7 @@ def log_prior(theta, idx, prior, use_re, reset_re):
         lp = lp + (2 * torch.log(se) + 2 * torch.log(1 - se) + torch.log(se) + torch.log(1 - se)).sum(-1)   # Beta(3,3) density on sigma + logit Jacobian (constant dropped)
     else:
         for k in ('w1', 'b1', 'w2', 'b2', 'eta_e'):
-            lp = lp + log_normal(sl(theta, idx, k), *prior[k]).sum(-1)
+            if k in idx: lp = lp + log_normal(sl(theta, idx, k), *prior[k]).sum(-1)
         if use_re:
             if reset_re:
                 lp = lp + log_normal(sl(theta, idx, 'eta_s'), *prior['eta_s']).sum(-1)
@@ -187,26 +191,28 @@ def log(method, strategy, k_eval, loc, scale, idx, hid, use_re):
 def cat_blocks(ks):
     return torch.cat([Xte[:, k] for k in ks], 1), torch.cat([yte[:, k] for k in ks], 1), torch.cat([Ste[:, k] for k in ks], 1)
 
-for method, use_re in (('BNN', False), ('BNN-RE', True)):
+METHODS = [m for m in os.environ.get('METHODS', 'BNN,BNN-RE,LMM-RE').split(',')]
+for method, use_re, H in (('BNN', False, HID), ('BNN-RE', True, HID), ('LMM-RE', True, 0)):
+    if method not in METHODS: continue
     t1 = time.time()
-    loc0, sc0, idx0 = fit(Xtr, ytr, Str, HID, use_re, None, False, STEPS, LR, seed=11)
-    log(method, 'initial', 0, loc0, sc0, idx0, HID, use_re)
+    loc0, sc0, idx0 = fit(Xtr, ytr, Str, H, use_re, None, False, STEPS, LR, seed=11)
+    log(method, 'initial', 0, loc0, sc0, idx0, H, use_re)
     print(f'[{form}] {method} initial fit {time.time() - t1:.0f}s', flush=True)
-    variants = [(v, v == 'b', v == 'c') for v in VARIANTS] if use_re else [('-', False, False)]
+    variants = [(v, v == 'b', v == 'c') for v in VARIANTS] if method == 'BNN-RE' else [('-', False, False)]
     for var, reset, temper in variants:
-        name = method if method == 'BNN' else f'BNN-RE({var})'
+        name = method if method != 'BNN-RE' else f'BNN-RE({var})'
         prev = (loc0, sc0, idx0); n_prev = Xtr.shape[1]; upd1 = None
         for k in range(1, KB):
             pr = recycled(*prev, temper_n=n_prev if temper else None)
-            loc, sc, idx = fit(Xte[:, k - 1], yte[:, k - 1], Ste[:, k - 1], HID, use_re, pr, reset, STEPS, LR, seed=20 + k)
-            r_ = log(name, 'cons', k, loc, sc, idx, HID, use_re)
+            loc, sc, idx = fit(Xte[:, k - 1], yte[:, k - 1], Ste[:, k - 1], H, use_re, pr, reset, STEPS, LR, seed=20 + k)
+            r_ = log(name, 'cons', k, loc, sc, idx, H, use_re)
             if k == 1: upd1 = [dict(x, strategy='cumu') for x in r_]; PEROBS[f'{name}|cumu|2'] = PEROBS[f'{name}|cons|2']
             prev = (loc, sc, idx); n_prev = N0 + BLK
         rows.extend(upd1)
         for k in (range(2, KB) if CUMU else []):
             xc, yc, sc_ = cat_blocks(range(k))
-            loc, sc, idx = fit(xc, yc, sc_, HID, use_re, recycled(loc0, sc0, idx0, temper_n=Xtr.shape[1] if temper else None), reset, STEPS, LR, seed=30 + k)
-            log(name, 'cumu', k, loc, sc, idx, HID, use_re)
+            loc, sc, idx = fit(xc, yc, sc_, H, use_re, recycled(loc0, sc0, idx0, temper_n=Xtr.shape[1] if temper else None), reset, STEPS, LR, seed=30 + k)
+            log(name, 'cumu', k, loc, sc, idx, H, use_re)
         print(f'[{form}] {name} updates done {time.time() - t1:.0f}s', flush=True)
 df = pd.DataFrame(rows)
 for r in range(R):
